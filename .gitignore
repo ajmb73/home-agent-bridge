@@ -1,1 +1,6 @@
-bridge-log-rotate.sh
+# Temp files
+*.log
+*.tmp
+
+# OS
+.DS_Store
