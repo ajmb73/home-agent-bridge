@@ -1,7 +1,10 @@
 #!/home/ale/.hermes/hermes-agent/venv/bin/python3
 """
-home-agent-bridge: Lightweight HTTP receiver for inter-agent communication.
+home-agent-bridge v1.058-1: Lightweight HTTP receiver for inter-agent communication.
 Receives messages from an OpenClaw agent via POST and queues them for processing.
+
+Version: 1.058-1 (May 8, 2026)
+https://github.com/ajmb73/home-agent-bridge
 
 Usage:
     python3 agent-bridge-server.py [--port 18473]
