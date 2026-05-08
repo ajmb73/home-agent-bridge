@@ -22,6 +22,7 @@ Endpoints:
 """
 
 import os
+import re
 import json
 import uuid
 import argparse
@@ -30,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     import uvicorn
     HAS_FASTAPI = True
 except ImportError:
@@ -128,11 +129,16 @@ if HAS_FASTAPI:
         return {"status": "ok", "bridge": "home-agent-bridge", "queue_len": len(get_messages())}
 
     @app.post("/message")
-    async def receive_message(body: dict):
+    async def receive_message(request: Request, body: dict):
+        content_len = request.headers.get("content-length")
+        if content_len and int(content_len) > MAX_BODY_SIZE:
+            raise HTTPException(status_code=413, detail="Request body too large")
         text = body.get("text", "")
         from_agent = body.get("from", "unknown")
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="Missing or empty 'text' field")
+        if len(from_agent) > 256:
+            raise HTTPException(status_code=400, detail="'from' field too long")
         msg = add_message(text, from_agent)
         return {"status": "queued", "id": msg["id"]}
 
@@ -195,6 +201,8 @@ else:
                 if not text:
                     raise ValueError("Empty text")
                 from_agent = data.get("from", "unknown")
+                if len(from_agent) > 256:
+                    raise ValueError("'from' field too long")
                 msg = add_message(text, from_agent)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -213,6 +221,12 @@ else:
                 return
 
             msg_id = self.path.split("/")[-1]
+            if not re.match(r'^[a-f0-9-]{8}$', msg_id):
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Invalid message ID format"}).encode())
+                return
             if remove_message(msg_id):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
