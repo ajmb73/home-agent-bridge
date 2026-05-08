@@ -9,6 +9,7 @@
 # =============================================================================
 
 set -e
+umask 077
 
 # ---- Configuration ------------------------------------------------------------
 REPO_URL="https://github.com/ajmb73/home-agent-bridge"
@@ -16,6 +17,9 @@ BRIDGE_PORT="18473"
 SKILL_DEST_DIR="${HOME}/.hermes/skills/openclaw-imports/agent-bridge"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOGFILE="${HOME}/.hermes/logs/agent-bridge-setup.log"
+
+# Ensure log directory exists
+mkdir -p "$(dirname "$LOGFILE")"
 
 # ---- Logging ------------------------------------------------------------------
 log() {
@@ -89,7 +93,7 @@ clone_or_update_repo() {
 install_skill() {
     info "Installing OpenClaw Agent-side skill..."
 
-    mkdir -p "$(dirname "$SKILL_DEST_DIR")"
+    mkdir -p "$SKILL_DEST_DIR"
 
     # Try to fetch SKILL.md from the repo first
     local skill_src="${SCRIPT_DIR}/home-agent-bridge/openclaw-agent-side/SKILL.md"
@@ -130,7 +134,7 @@ test_connection() {
     fi
 
     # Simple TCP connectivity test using Python
-    python3 - << 'PYEOF'
+    if python3 - << 'PYEOF'
 import socket, sys, time
 
 HOST = "localhost"
@@ -148,8 +152,7 @@ except Exception as e:
     print(f"CONNECTION_FAILED: {e}")
     sys.exit(1)
 PYEOF
-
-    if [ $? -eq 0 ]; then
+    then
         info "Successfully connected to Hermes Agent bridge on port ${BRIDGE_PORT}."
     else
         warn "Could not connect to bridge on port ${BRIDGE_PORT}."
