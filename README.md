@@ -104,6 +104,20 @@ curl -X DELETE http://127.0.0.1:18473/message/<id>
 | `GET` | `/messages` | Get all pending messages. Returns `{"messages": [...]}` |
 | `DELETE` | `/message/<id>` | Acknowledge and remove a message. Returns `{"status": "removed"}` |
 
+## Queue Files
+
+Messages are stored as JSONL files in `/tmp/agent-bridge/`:
+
+- `incoming.jsonl` — all queued messages (from, text, time, id)
+- `processed.jsonl` — acknowledged messages (archived daily)
+- `queue.lock` — lock file for atomic operations
+
+Processed entries are archived daily via `bridge-log-rotate.sh` (runs as a cron job) and stored in gzip archives with configurable retention (default: 7-day live, 30-day archive).
+
+## Version
+
+Current version: `1.158-2` (see `VERSION` file in repo). Calendar versioning: `Y.MMDD-N`.
+
 ## Security Notes
 
 - Server binds to `127.0.0.1` — only accessible from the local machine
