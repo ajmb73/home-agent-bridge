@@ -1,24 +1,21 @@
 #!/home/ale/.hermes/hermes-agent/venv/bin/python3
 """
-home-agent-bridge v1.058-1: Lightweight HTTP receiver for inter-agent communication.
+home-agent-bridge v1.258-1: Lightweight HTTP receiver for inter-agent communication.
 Receives messages from an OpenClaw agent via POST and queues them for processing.
-
-Version: 1.058-1 (May 8, 2026)
-https://github.com/ajmb73/home-agent-bridge
 
 Usage:
     python3 agent-bridge-server.py [--port 18473]
 
 Endpoints:
     POST /message - Send a message to Hermes Agent
-        Body: {"text": "message content", "from": "openclaw"}
+        Body: {"text": "message content", "from": "openclaw", "to": "hermes"}
         Returns: {"status": "queued", "id": "<timestamp>"}
 
     GET /status - Health check
         Returns: {"status": "ok", "bridge": "home-agent-bridge"}
 
     GET /messages - Get pending messages for Hermes Agent to process
-        Returns: {"messages": [{"id": "...", "text": "...", "from": "openclaw", "time": "..."}]}
+        Returns: {"messages": [{"id": "...", "text": "...", "from": "openclaw", "to": "hermes", "time": "..."}]}
 
     DELETE /message/<id> - Acknowledge message was processed
         Returns: {"status": "removed"}
@@ -81,7 +78,7 @@ def save_queue(messages, lock_fd=None):
         for m in messages:
             f.write(json.dumps(m) + '\n')
 
-def add_message(text: str, from_agent: str) -> dict:
+def add_message(text: str, from_agent: str, to_agent: str = "") -> dict:
     """Add a message to the queue with file locking."""
     if not text or not text.strip():
         raise ValueError("Message text cannot be empty")
@@ -90,6 +87,7 @@ def add_message(text: str, from_agent: str) -> dict:
         "id": str(uuid.uuid4())[:8],
         "text": text.strip(),
         "from": from_agent,
+        "to": to_agent,
         "time": datetime.now().isoformat()
     }
     lock_fd = acquire_lock()
@@ -138,16 +136,21 @@ if HAS_FASTAPI:
             raise HTTPException(status_code=413, detail="Request body too large")
         text = body.get("text", "")
         from_agent = body.get("from", "unknown")
+        to_agent = body.get("to", "")
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="Missing or empty 'text' field")
         if len(from_agent) > 256:
             raise HTTPException(status_code=400, detail="'from' field too long")
-        msg = add_message(text, from_agent)
+        if len(to_agent) > 256:
+            raise HTTPException(status_code=400, detail="'to' field too long")
+        msg = add_message(text, from_agent, to_agent)
         return {"status": "queued", "id": msg["id"]}
 
     @app.get("/messages")
     async def list_messages():
-        return {"messages": get_messages()}
+        raw = get_messages()
+        messages = [{"id": m["id"], "text": m["text"], "from": m["from"], "to": m.get("to", ""), "time": m["time"]} for m in raw]
+        return {"messages": messages}
 
     @app.delete("/message/{msg_id}")
     async def acknowledge_message(msg_id: str):
@@ -173,10 +176,12 @@ else:
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "ok", "bridge": "home-agent-bridge"}).encode())
             elif self.path == "/messages":
+                raw = get_messages()
+                msgs = [{"id": m["id"], "text": m["text"], "from": m["from"], "to": m.get("to", ""), "time": m["time"]} for m in raw]
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"messages": get_messages()}).encode())
+                self.wfile.write(json.dumps({"messages": msgs}).encode())
 
         def do_POST(self):
             if self.path != "/message":
@@ -204,9 +209,10 @@ else:
                 if not text:
                     raise ValueError("Empty text")
                 from_agent = data.get("from", "unknown")
-                if len(from_agent) > 256:
-                    raise ValueError("'from' field too long")
-                msg = add_message(text, from_agent)
+                to_agent = data.get("to", "")
+                if len(from_agent) > 256 or len(to_agent) > 256:
+                    raise ValueError("'from' or 'to' field too long")
+                msg = add_message(text, from_agent, to_agent)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
