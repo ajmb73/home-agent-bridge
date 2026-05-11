@@ -25,7 +25,7 @@ OpenClaw Agent  ←→  HTTP Bridge (port 18473)  ←→  Hermes Agent
 - **Responsive**: Sub-second latency when Hermes polls the bridge frequently (configurable poll interval)
 - **Secure**: Binds to localhost only — not exposed to the internet
 - **Stateless**: Messages queued in JSONL files — survives restarts
-- **Batch operations**: Acknowledge or fetch multiple messages in a single request (v2.0.0)
+- **Batch operations**: Acknowledge multiple messages in a single request (v2.0.0)
 
 ## Requirements
 
