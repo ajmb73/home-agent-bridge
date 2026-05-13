@@ -206,9 +206,36 @@ Messages are stored as JSONL files in `/tmp/agent-bridge/`:
 
 Processed entries are archived daily via `bridge-log-rotate.sh` (runs as a cron job) and stored in gzip archives with configurable retention (default: 7-day live, 30-day archive).
 
+## Polling Scripts
+
+Hermes uses a polling script (`bridge-poller-hermy.sh`) to receive messages in real-time. This script runs every minute via cron, polls the bridge for messages addressed to "hermy", and forwards them to Telegram.
+
+### bridge-poller-hermy.sh (Hermes side)
+
+```
+*/1 * * * * export TELEGRAM_BOT_TOKEN="$(grep TELEGRAM_BOT_TOKEN /home/ale/.hermes/.env | cut -d= -f2)" && export TELEGRAM_CHAT_ID="$(grep TELEGRAM_HOME_CHANNEL /home/ale/.hermes/.env | cut -d= -f2)" && /home/ale/.hermes/scripts/bridge-poller-hermy.sh > /dev/null 2>&1
+```
+
+Features:
+- Polls `GET /messages?to=hermy` every minute
+- Forwards messages to Telegram (chat ID from `~/.hermes/.env`)
+- Rate-limited to 1 message per 30 seconds (prevents flooding)
+- Idempotent via `flock` (prevents duplicate sends)
+- Leaves messages in queue if Telegram fails (retry on next poll)
+- Logs to `/home/ale/.hermes/logs/bridge-poller.log`
+
+### bridge-poll.sh (OpenClaw side)
+
+Bobby uses a simpler poller at `/tmp/bridge-poll.sh`:
+```
+*/1 * * * * /tmp/bridge-poll.sh > /dev/null 2>&1
+```
+
+Both pollers ensure bidirectional real-time communication between the two agents.
+
 ## Version
 
-Current version: `2.0.0` — see `VERSION` file in repo.
+Current version: `2.0.1` — see `VERSION` file in repo.
 
 ## Security Notes
 
