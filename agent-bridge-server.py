@@ -50,6 +50,32 @@ DEFAULT_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 # Valid message types
 VALID_MESSAGE_TYPES = frozenset(["health_check", "proposal", "task", "response", "note", "alert", ""])
 
+# Registered callbacks for instant delivery (loaded from disk on startup)
+CALLBACKS_FILE = QUEUE_DIR / "callbacks.json"
+CALLBACKS = {}  # {agent_name: callback_url}
+
+def load_callbacks():
+    """Load callbacks from disk if they exist."""
+    global CALLBACKS
+    if CALLBACKS_FILE.exists():
+        try:
+            import json
+            CALLBACKS = json.loads(CALLBACKS_FILE.read_text())
+        except Exception:
+            CALLBACKS = {}
+
+def save_callbacks():
+    """Persist callbacks to disk."""
+    try:
+        import json
+        CALLBACKS_FILE.write_text(json.dumps(CALLBACKS))
+        CALLBACKS_FILE.chmod(0o600)
+    except Exception:
+        pass
+
+# Load callbacks on startup
+load_callbacks()
+
 
 class BridgeStats:
     """Tracks bridge health metrics."""
@@ -387,13 +413,84 @@ def get_status() -> dict:
         "last_activity": last_act,
     }
 
+def trigger_callback(agent: str, message: dict):
+    """POST message to registered callback URL if available."""
+    if agent not in CALLBACKS:
+        return
+    callback_url = CALLBACKS[agent]
+    try:
+        import urllib.request
+        import json
+        data = json.dumps(message).encode('utf-8')
+        req = urllib.request.Request(
+            callback_url,
+            data=data,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                print(f"Callback triggered for {agent}: {message.get('id', 'unknown')}")
+            else:
+                print(f"Callback failed for {agent}: HTTP {resp.status}")
+    except Exception as e:
+        print(f"Callback error for {agent}: {e}")
+
+
+
 
 if HAS_FASTAPI:
     app = FastAPI(title="Home Agent Bridge v2", description="HTTP bridge for inter-agent communication")
 
+    @app.post("/callback")
+    async def register_callback(body: dict):
+        """Register a callback URL for an agent (localhost only for security)."""
+        from urllib.parse import urlparse
+        import ipaddress
+
+        agent = body.get("agent", "")
+        url = body.get("url", "")
+        if not agent or not url:
+            raise HTTPException(status_code=400, detail="Both 'agent' and 'url' are required")
+        if len(agent) > 256 or len(url) > 1024:
+            raise HTTPException(status_code=400, detail="Agent or URL too long")
+
+        # SSRF protection: validate URL scheme and hostname
+        try:
+            parsed = urlparse(url)
+            scheme = parsed.scheme.lower()
+            hostname = parsed.hostname or ""
+
+            # Only allow http/https
+            if scheme not in ("http", "https"):
+                raise HTTPException(status_code=400, detail="Only http/https schemes allowed")
+
+            # Only allow localhost connections (security boundary)
+            if hostname not in ("localhost", "127.0.0.1", "::1"):
+                raise HTTPException(status_code=400, detail="Callback URL must be localhost")
+
+            # Block obviously malicious hostnames
+            if hostname.startswith("169.254.169.254") or hostname == "metadata.google.internal":
+                raise HTTPException(status_code=400, detail="Cloud metadata endpoints not allowed")
+
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid callback URL")
+
+        CALLBACKS[agent] = url
+        save_callbacks()
+        return {"status": "registered", "agent": agent, "url": url}
+
+
     @app.get("/status")
     async def status():
         return get_status()
+
+    @app.get("/callbacks")
+    async def list_callbacks():
+        """Return all registered callbacks."""
+        return {"callbacks": dict(CALLBACKS)}
 
     @app.post("/message")
     async def receive_message(request: Request, body: dict):
@@ -421,6 +518,9 @@ if HAS_FASTAPI:
 
         try:
             msg = add_message(text, from_agent, to_agent, expires_at, msg_type)
+            # Trigger callback if registered for recipient
+            if to_agent in CALLBACKS:
+                trigger_callback(to_agent, msg)
             return {"status": "queued", "id": msg["id"]}
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -520,6 +620,8 @@ else:
         def do_GET(self):
             if self.path == "/status":
                 self._json_response(get_status())
+            elif self.path == "/callbacks":
+                self._json_response({"callbacks": dict(CALLBACKS)})
             elif self.path.startswith("/messages"):
                 # Parse query params with URL decoding
                 params = {}
@@ -589,6 +691,9 @@ else:
 
                 try:
                     msg = add_message(text, from_agent, to_agent, expires_at, msg_type)
+                    # Trigger callback if registered for recipient
+                    if to_agent in CALLBACKS:
+                        trigger_callback(to_agent, msg)
                     self._json_response({"status": "queued", "id": msg["id"]})
                 except ValueError as e:
                     self._error_response(400, str(e))
@@ -640,6 +745,58 @@ else:
                     _stats.error_count += 1
                     _stats.save()
                     self._error_response(500, str(e))
+
+            elif self.path == "/callback":
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > MAX_BODY_SIZE:
+                    self._error_response(413, "Request body too large")
+                    return
+                if content_len == 0:
+                    self._error_response(400, "Empty body")
+                    return
+
+                body = self.rfile.read(content_len).decode('utf-8', errors='replace')
+                try:
+                    data = json.loads(body)
+                except json.JSONDecodeError:
+                    self._error_response(400, "Invalid JSON")
+                    return
+
+                agent = data.get("agent", "")
+                url = data.get("url", "")
+                if not agent or not url:
+                    self._error_response(400, "Both 'agent' and 'url' are required")
+                    return
+                if len(agent) > 256 or len(url) > 1024:
+                    self._error_response(400, "Agent or URL too long")
+                    return
+
+                # SSRF protection: validate URL scheme and hostname
+                from urllib.parse import urlparse
+                try:
+                    parsed = urlparse(url)
+                    scheme = parsed.scheme.lower()
+                    hostname = parsed.hostname or ""
+
+                    if scheme not in ("http", "https"):
+                        self._error_response(400, "Only http/https schemes allowed")
+                        return
+
+                    if hostname not in ("localhost", "127.0.0.1", "::1"):
+                        self._error_response(400, "Callback URL must be localhost")
+                        return
+
+                    if hostname.startswith("169.254.169.254") or hostname == "metadata.google.internal":
+                        self._error_response(400, "Cloud metadata endpoints not allowed")
+                        return
+                except Exception:
+                    self._error_response(400, "Invalid callback URL")
+                    return
+
+                CALLBACKS[agent] = url
+                save_callbacks()
+                self._json_response({"status": "registered", "agent": agent, "url": url})
+
 
             else:
                 self._error_response(404, "Not found")

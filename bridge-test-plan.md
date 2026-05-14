@@ -1,22 +1,38 @@
-# Bridge Test Plan — v2.0.1
+# Bridge Test Plan — v2.0.2
 
-**Last updated:** 2026-05-13  
-**Bridge:** http://localhost:18473 | Server uptime: 81.9h | Errors: 0 | Queue: 0  
-**Branch:** experimental/refactor
+**Last updated:** 2026-05-14
+**Bridge:** http://localhost:18473 | Callback: http://localhost:18474 | Queue: 0
+**Branch:** main
 
 ---
 
-## Architecture
+## Architecture (v2.0.2 — with Callback Port)
 
 ```
-OpenClaw Agent (Bobby) ──── POST/DELETE ────► Bridge Server (port 18473) ◄── GET/poll ──── Hermes Agent (Hermy)
-         │                                             │                              │
-         │◄─── /tmp/hermy-to-bobby.md ◄─────────────── Bobby's poller                   │
-         │                                                    │                          │
-         ▼                                                    ▼                          ▼
-   reads messages                                      deletes after read          Telegram push via
-   writes responses                                                                bridge-poller-hermy.sh
-   to bridge via POST                                                                 (rate-limited 30s)
+OpenClaw Agent (Bobby) ──── POST ────► Bridge Server (:18473) ──── POST (instant) ────► Callback Server (:18474) ──── Telegram
+                                     │                                                      │
+                                     └── GET/poll (fallback) ◄── bridge-poller-hermy.sh ◄─┘
+                                     │
+                                     └── GET/poll ──── Bobby's poller ──── /tmp/hermy-to-bobby.md
+```
+
+**Delivery path (preferred):** Bridge → Callback Server → Telegram (instant, seconds)
+**Fallback:** Polling (60s interval) — activates if callback server is down
+
+**Components:**
+- `agent-bridge-server.py` — HTTP message queue on :18473, triggers callbacks on new messages
+- `callback-server.py` — lightweight HTTP server on :18474, forwards to Telegram and ACKs bridge
+- `bridge-poller-hermy.sh` — polling fallback (every 60s)
+- `start-bridge-server.sh` — bridge startup script with @reboot cron
+- `start-callback-server.sh` — callback server startup script with @reboot cron
+- `/tmp/agent-bridge/callbacks.json` — persisted callback registrations (survives bridge restart)
+
+**Crontab:**
+```
+*/1 * * * * export TELEGRAM_BOT_TOKEN=... && /home/ale/.hermes/scripts/bridge-poller-hermy.sh > /dev/null 2>&1
+*/1 * * * * /tmp/bridge-poll.sh > /dev/null 2>&1
+@reboot /home/ale/.hermes/scripts/start-bridge-server.sh
+@reboot /home/ale/.hermes/scripts/start-callback-server.sh
 ```
 
 ---
@@ -237,3 +253,292 @@ Run full test suite:
 - After any poller or bridge code change
 - Weekly health check (every Sunday)
 - After any system update that might affect cron
+
+---
+
+## TEST 8: Callback Server Startup
+
+**Goal:** Verify callback server starts correctly.
+
+**Steps:**
+```bash
+# Start callback server
+/home/ale/.hermes/scripts/start-callback-server.sh
+
+# Verify it's running
+curl -s http://localhost:18474/health
+
+# Check log
+tail -5 /home/ale/.hermes/logs/callback-server.log
+```
+
+**Pass criteria:** Health returns `{"status": "ok", "service": "callback-server"}`
+
+---
+
+## TEST 9: Callback Registration
+
+**Goal:** Verify callback can be registered with bridge.
+
+**Steps:**
+```bash
+# Register callback (requires bridge server restart with callback support)
+curl -s -X POST http://localhost:18473/callback \
+  -H "Content-Type: application/json" \
+  -d '{"agent": "hermy", "url": "http://localhost:18474/notify"}
+
+# Verify registration
+curl -s http://localhost:18473/status | python3 -c "import sys,json; print(json.load(sys.stdin))"
+```
+
+**Pass criteria:** Returns `{"status": "registered", "agent": "hermy", "url": "..."}`
+
+---
+
+## TEST 10: Callback Instant Delivery
+
+**Goal:** Verify message is delivered via callback immediately (not waiting for polling).
+
+**Steps:**
+1. Ensure callback server is running
+2. Register callback with bridge
+3. Send message from Bobby to Hermy:
+   ```bash
+   curl -s -X POST http://localhost:18473/message \
+     -H "Content-Type: application/json" \
+     -d '{"from":"bobby","to":"hermy","type":"note","text":"[CALLBACK TEST] Instant push test"}'
+   ```
+4. Check Telegram — should arrive within seconds
+5. Verify queue is 0 after callback delivery:
+   ```bash
+   curl -s http://localhost:18473/status | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Queue: {d[\"queue_len\"]}')"
+   ```
+
+**Pass criteria:** Message arrives in Telegram within 10 seconds, queue shows 0.
+
+---
+
+## TEST 11: Callback Failure Fallback
+
+**Goal:** Verify polling fallback works when callback server is down.
+
+**Steps:**
+1. Stop callback server (simulate outage):
+   ```bash
+   kill $(cat /tmp/callback-server.pid 2>/dev/null) 2>/dev/null || true
+   ```
+2. Send message to Hermy:
+   ```bash
+   curl -s -X POST http://localhost:18473/message \
+     -H "Content-Type: application/json" \
+     -d '{"from":"bobby","to":"hermy","type":"note","text":"[FALLBACK TEST] Polling fallback test"}'
+   ```
+3. Wait up to 60 seconds for polling fallback to deliver
+4. Check Telegram — should arrive via polling
+
+**Pass criteria:** Message arrives within 60 seconds via polling fallback.
+
+---
+
+## TEST 12: Rate Limit Behavior (Callback)
+
+**Goal:** Verify callback respects 30-second rate limit.
+
+**Steps:**
+1. Start callback server
+2. Send 3 messages rapidly:
+   ```bash
+   for i in 1 2 3; do
+     curl -s -X POST http://localhost:18473/message \
+       -H "Content-Type: application/json" \
+       -d "{\"from\":\"bobby\",\"to\":\"hermy\",\"type\":\"note\",\"text\":\"[RATE LIMIT TEST $i]\"}"
+   done
+   ```
+3. First message should arrive within seconds
+4. Subsequent messages should be delayed by rate limit
+
+**Pass criteria:** Messages arrive spaced by ~30 seconds each.
+
+---
+
+## Verification: Callback Integration
+
+```bash
+# 1. Callback server health
+curl -s http://localhost:18474/health
+
+# 2. Callback registered in bridge
+# (restart bridge with callback support first)
+
+# 3. Process running
+ps aux | grep -q '[c]allback-server' && echo "Callback server: OK" || echo "Callback server: DOWN"
+
+# 4. PID file exists
+ls -la /tmp/callback-server.pid
+
+# 5. Log file exists and has recent entries
+tail -3 /home/ale/.hermes/logs/callback-server.log
+```
+
+---
+
+## Callback Architecture
+
+```
+OpenClaw Agent (Bobby) ──── POST ────► Bridge Server (:18473) ──── POST (instant) ────► Callback Server (:18474) ──── Telegram ──── Ale
+                                     │                                                            │
+                                     └─── polling fallback (60s) ──── bridge-poller-hermy.sh ◄─────┘
+```
+
+**Flow:**
+1. Bobby POSTs message to bridge with `to=hermy`
+2. Bridge stores message in queue and immediately POSTs to callback URL (if registered)
+3. Callback server receives message, sends to Telegram
+4. On success, callback server DELETEs message from bridge
+5. If callback fails or is down, polling fallback picks up message within 60 seconds
+
+---
+
+## TEST 8: Callback Instant Delivery
+
+**Goal:** Verify callback delivers messages in seconds (not 60s polling lag).
+
+**Steps:**
+1. Start callback server (if not running):
+   ```bash
+   /home/ale/.hermes/scripts/start-callback-server.sh
+   ```
+2. Register callback (if not already registered):
+   ```bash
+   curl -s -X POST http://localhost:18473/callback \
+     -H "Content-Type: application/json" \
+     -d '{"agent": "hermy", "url": "http://localhost:18474/notify"}'
+   ```
+3. Verify callback server is healthy:
+   ```bash
+   curl -s http://localhost:18474/health
+   ```
+4. Clear any pending messages:
+   ```bash
+   curl -s -X POST http://localhost:18473/messages/ack \
+     -H "Content-Type: application/json" \
+     -d '{"ids": [], "by": "hermy"}'  # ack all
+   ```
+5. Send test message and time it:
+   ```bash
+   START=$(date +%s.%N)
+   curl -s -X POST http://localhost:18473/message \
+     -H "Content-Type: application/json" \
+     -d '{"from":"bobby","to":"hermy","type":"note","text":"[TEST 8] Callback speed test"}'
+   sleep 5
+   END=$(date +%s.%N)
+   ELAPSED=$(echo "$END - $START" | bc)
+   echo "Elapsed: ${ELAPSED}s"
+   ```
+6. Check callback server log:
+   ```bash
+   tail -3 /home/ale/.hermes/logs/callback-server.log
+   ```
+
+**Pass criteria:** Message delivered to Telegram in < 10 seconds (callback path), callback log shows "Telegram delivery successful" within seconds of send.
+
+---
+
+## TEST 9: Polling Fallback (Callback Down)
+
+**Goal:** Verify polling fallback kicks in when callback server is down.
+
+**Steps:**
+1. Send 2 messages with callback server running (they should arrive via callback):
+   ```bash
+   curl -s -X POST http://localhost:18473/message \
+     -H "Content-Type: application/json" \
+     -d '{"from":"bobby","to":"hermy","type":"note","text":"[TEST 9a] Before callback stop"}'
+   ```
+2. Stop callback server:
+   ```bash
+   kill $(cat /tmp/callback-server.pid 2>/dev/null) 2>/dev/null
+   rm -f /tmp/callback-server.pid
+   ```
+3. Send message while callback is down:
+   ```bash
+   curl -s -X POST http://localhost:18473/message \
+     -H "Content-Type: application/json" \
+     -d '{"from":"bobby","to":"hermy","type":"note","text":"[TEST 9b] While callback down - should use polling fallback"}'
+   ```
+4. Wait 90 seconds (polling interval is 60s)
+5. Check if message arrived via polling fallback (should appear in Telegram within 60-90s)
+
+**Pass criteria:** Message sent while callback was down arrives via polling fallback within 60-90 seconds.
+
+---
+
+## TEST 10: Callback Persistence (Bridge Restart)
+
+**Goal:** Verify callbacks survive bridge server restart via callbacks.json.
+
+**Steps:**
+1. Verify callback is registered:
+   ```bash
+   curl -s http://localhost:18473/callbacks | python3 -m json.tool
+   ```
+2. Verify callbacks.json exists:
+   ```bash
+   cat /tmp/agent-bridge/callbacks.json
+   ```
+3. Restart bridge server:
+   ```bash
+   kill $(cat /tmp/bridge-server.pid 2>/dev/null) 2>/dev/null
+   sleep 2
+   /home/ale/.hermes/scripts/start-bridge-server.sh
+   sleep 3
+   ```
+4. Verify callback is still registered without manual re-registration:
+   ```bash
+   curl -s http://localhost:18473/callbacks | python3 -m json.tool
+   ```
+5. Send test message — should still be delivered via callback instantly:
+   ```bash
+   curl -s -X POST http://localhost:18473/message \
+     -H "Content-Type: application/json" \
+     -d '{"from":"bobby","to":"hermy","type":"note","text":"[TEST 10] Post-restart callback test"}'
+   ```
+6. Wait 10s and check Telegram
+
+**Pass criteria:** Callback auto-registered from callbacks.json on bridge restart, message delivered instantly.
+
+---
+
+## TEST 11: End-to-End Bidirectional Full Cycle
+
+**Goal:** Complete round-trip: Bobby → bridge → Hermy (callback) → Telegram AND Hermy → bridge → Bobby (poller) → file.
+
+**Steps:**
+1. Bobby → Hermy via callback (Telegram):
+   ```bash
+   curl -s -X POST http://localhost:18473/message \
+     -H "Content-Type: application/json" \
+     -d '{"from":"bobby","to":"hermy","type":"note","text":"[TEST 11a] Bobby to Hermy via callback"}'
+   ```
+   → Should arrive in Telegram within 10s
+
+2. Hermy → Bobby via polling (file):
+   ```bash
+   curl -s -X POST http://localhost:18473/message \
+     -H "Content-Type: application/json" \
+     -d '{"from":"hermy","to":"bobby","type":"note","text":"[TEST 11b] Hermy to Bobby"}'
+   ```
+   → Should appear in /tmp/hermy-to-bobby.md within 60s
+
+3. Wait 90 seconds for both to complete
+
+4. Verify both directions:
+   ```bash
+   echo "=== Telegram (TEST 11a) — check your Telegram DM ==="
+   echo "=== Bobby's file ==="
+   tail -3 /tmp/hermy-to-bobby.md
+   echo "=== Bridge queue ==="
+   curl -s http://localhost:18473/status | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Queue: {d[\"queue_len\"]}')"
+   ```
+
+**Pass criteria:** Both messages delivered, queue at 0.
