@@ -90,12 +90,12 @@ curl -X POST http://127.0.0.1:18473/messages/ack \
 │                     (fallback path)                         │
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │  Bridge Server (127.0.0.1:18473)                  │   │
-│   │  ├── GET /status        → health + stats          │   │
-│   │  ├── POST /message      → queue message           │   │
-│   │  ├── GET /messages      → list pending messages   │   │
-│   │  ├── DELETE /message/<id> → ack single message   │   │
-│   │  └── POST /messages/ack → batch ack              │   │
+│   │  Bridge Server (127.0.0.1:18473)                    │   │
+│   │  ├── GET /status        → health + stats            │   │
+│   │  ├── POST /message      → queue message             │   │
+│   │  ├── GET /messages      → list pending messages     │   │
+│   │  ├── DELETE /message/<id> → ack single message      │   │
+│   │  └── POST /messages/ack → batch ack                 │   │
 │   └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
