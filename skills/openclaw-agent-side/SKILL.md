@@ -41,12 +41,12 @@ curl -X DELETE http://127.0.0.1:18473/message/<id>
 
 If the HTTP bridge is unavailable, use shared files:
 
-**OpenClaw → Hermes:** Write to `/tmp/hermy-to-bobby.md`, then invoke Hermes via SSH:
+**OpenClaw Agent → Hermes Agent:** Write to shared file, then invoke Hermes via SSH:
 ```bash
 ssh ale@ai.home "~/.hermes/hermes-agent/venv/bin/hermes chat -q 'Read /tmp/hermy-to-bobby.md' -Q --max-turns 5"
 ```
 
-**Hermes → OpenClaw:** Write to `/tmp/bobby-to-hermy.md`, poll via Hermes skill.
+**Hermes Agent → OpenClaw Agent:** Write to shared file, poll via Hermes skill.
 
 ## Health Check
 

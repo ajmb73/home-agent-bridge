@@ -38,7 +38,7 @@ nohup python3 ~/.hermes/scripts/agent-bridge-server.py --port 18473 > /tmp/agent
 1. OpenClaw Agent sends: `curl -X POST http://127.0.0.1:18473/message -H "Content-Type: application/json" -d '{"text":"do something","from":"openclaw"}'`
 2. Message queued at `/tmp/agent-bridge/incoming.jsonl`
 3. Hermes Agent polls GET `/messages` or is notified via Telegram
-4. Hermes processes and writes response to `/tmp/hermy-to-bobby.md` (shared file fallback)
+4. Hermes Agent processes and writes response to a shared file fallback path
 5. OpenClaw Agent reads the response file
 
 ## Checking for New Messages

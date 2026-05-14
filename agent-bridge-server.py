@@ -1,7 +1,7 @@
 #!/home/ale/.hermes/hermes-agent/venv/bin/python3
 """
 home-agent-bridge v2.0.0: Lightweight HTTP queue for inter-agent communication.
-Supports Bobby (OpenClaw) and Hermy (Hermes) messaging.
+Supports OpenClaw Agent and Hermes Agent messaging.
 
 v2 Features:
   - Structured health endpoint: GET /status returns uptime, counters, queue age

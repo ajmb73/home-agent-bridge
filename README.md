@@ -208,16 +208,16 @@ Processed entries are archived daily via `bridge-log-rotate.sh` (runs as a cron 
 
 ## Polling Scripts
 
-Hermes uses a polling script (`bridge-poller-hermy.sh`) to receive messages in real-time. This script runs every minute via cron, polls the bridge for messages addressed to "hermy", and forwards them to Telegram.
+Hermes Agent uses a polling script (`bridge-poller-hermy.sh`) to receive messages in real-time. This script runs every minute via cron, polls the bridge for messages addressed to the Hermes Agent identity, and forwards them to Telegram.
 
-### bridge-poller-hermy.sh (Hermes side)
+### bridge-poller-hermy.sh (Hermes Agent side)
 
 ```
 */1 * * * * export TELEGRAM_BOT_TOKEN="$(grep TELEGRAM_BOT_TOKEN /home/ale/.hermes/.env | cut -d= -f2)" && export TELEGRAM_CHAT_ID="$(grep TELEGRAM_HOME_CHANNEL /home/ale/.hermes/.env | cut -d= -f2)" && /home/ale/.hermes/scripts/bridge-poller-hermy.sh > /dev/null 2>&1
 ```
 
 Features:
-- Polls `GET /messages?to=hermy` every minute
+- Polls `GET /messages` filtered by Hermes Agent recipient every minute
 - Forwards messages to Telegram (chat ID from `~/.hermes/.env`)
 - Rate-limited to 1 message per 30 seconds (prevents flooding)
 - Idempotent via `flock` (prevents duplicate sends)
@@ -226,7 +226,7 @@ Features:
 
 ### bridge-poll.sh (OpenClaw side)
 
-Bobby uses a simpler poller at `/tmp/bridge-poll.sh`:
+OpenClaw Agent uses a simpler poller at `/tmp/bridge-poll.sh`:
 ```
 */1 * * * * /tmp/bridge-poll.sh > /dev/null 2>&1
 ```
