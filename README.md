@@ -32,10 +32,13 @@ OpenClaw Agent  ←→  HTTP Bridge (port 18473)  ←→  Hermes Agent
 - Python 3.8+
 - Both agents running on the same machine (or same local network)
 - SSH access between agents (for Hermes CLI invocations)
+- Auth token file at `/tmp/agent-bridge/auth_token` (auto-generated on first server start)
 
 ## Quick Start
 
-### 1. Install the bridge server
+### 1. Start the bridge server
+
+The server auto-generates an auth token on first start. Subsequent calls must include it.
 
 ```bash
 # Navigate to the scripts directory
@@ -46,33 +49,35 @@ python3 agent-bridge-server.py --port 18473 &
 
 # Verify it's running
 curl http://127.0.0.1:18473/status
-# → {"status": "ok", "bridge": "home-agent-bridge", "version": "2.0.0", ...}
+# → {"status": "ok", "bridge": "home-agent-bridge", "version": "2.0.2", ...}
+
+# Auth token is at:
+cat /tmp/agent-bridge/auth_token
 ```
 
-### 2. Configure the OpenClaw Agent side
+### 2. Send a message (auth required)
 
-Send a message to the bridge:
+All endpoints except `GET /status` require the `x-agent-token` header:
 
 ```bash
 curl -X POST http://127.0.0.1:18473/message \
   -H "Content-Type: application/json" \
-  -d '{"text":"your message here", "from":"openclaw", "to":"hermes"}'
+  -H "x-agent-token: $(cat /tmp/agent-bridge/auth_token)" \
+  -d '{"text":"hello from bobby", "from":"bobby", "to":"hermy"}'
 ```
 
-### 3. Configure the Hermes Agent side
+### 3. Poll for messages
+
+Messages are filtered by default — `to=""` broadcast messages are excluded from agent-specific queries. Use `?include_broadcast=true` to include them.
 
 ```bash
-# Poll for messages addressed to hermes
-curl "http://127.0.0.1:18473/messages?for=hermes"
+# Get messages for hermy
+curl "http://127.0.0.1:18473/messages?for=hermy" \
+  -H "x-agent-token: $(cat /tmp/agent-bridge/auth_token)"
 
-# Acknowledge (remove) a processed message
-curl -X DELETE "http://127.0.0.1:18473/message/<id>?by=hermes"
-
-# Batch acknowledge multiple messages at once
-curl -X POST http://127.0.0.1:18473/messages/ack \
-  -H "Content-Type: application/json" \
-  -d '{"ids": ["abc12345", "def67890"], "by": "hermes"}'
-```
+# Include broadcast messages (to="")
+curl "http://127.0.0.1:18473/messages?for=hermy&include_broadcast=true" \
+  -H "x-agent-token: $(cat /tmp/agent-bridge/auth_token)"
 
 ## Architecture
 
@@ -143,9 +148,10 @@ Response: `{"status": "queued", "id": "abc12345"}`
 
 ### GET /messages
 
-Get pending messages. Optional query params:
+Get pending messages. **Auth required** (except `/status`). Optional query params:
 - `for=<agent>` — filter by recipient
 - `type=<type>` — filter by message type
+- `include_broadcast=true` — include broadcast messages (to="")
 
 Response:
 
@@ -155,8 +161,8 @@ Response:
     {
       "id": "abc12345",
       "text": "hello",
-      "from": "openclaw",
-      "to": "hermes",
+      "from": "bobby",
+      "to": "hermy",
       "type": "task",
       "time": "2026-05-11T15:00:00+00:00",
       "expires_at": ""
@@ -183,14 +189,14 @@ Batch acknowledge multiple messages. Body:
 }
 ```
 
-Maximum 100 IDs per request. All-or-nothing: if any ID doesn't exist, no messages are removed.
+Maximum 100 IDs per request. Partial processing: any IDs that don't exist are returned in `not_found`, the rest are still acked.
 
 Response:
 
 ```json
 {
-  "acknowledged": ["abc12345", "def67890", "ghi11111"],
-  "not_found": [],
+  "acknowledged": ["abc12345", "def67890"],
+  "not_found": ["ghi11111"],
   "acknowledged_at": "2026-05-11T15:05:00+00:00"
 }
 ```
@@ -240,8 +246,12 @@ Current version: `2.0.1` — see `VERSION` file in repo.
 ## Security Notes
 
 - Server binds to `127.0.0.1` — only accessible from the local machine
-- No authentication on endpoints — relies on network isolation
-- Queue files stored in `/tmp/agent-bridge/` with `0700` permissions (owner-only read/write)
+- All endpoints except `GET /status` require `x-agent-token` header (token stored in `/tmp/agent-bridge/auth_token`)
+- Token validated with `secrets.compare_digest` (timing-safe)
+- Broadcast messages (`to=""`) excluded from agent-specific queries by default — prevents cross-contamination
+- Message text capped at 10KB — prevents unbounded payload attacks
+- SSRF protection: callback hostnames resolved to IP before checking `127.0.0.0/8`
+- Queue files in `/tmp/agent-bridge/` with `0700` permissions (owner-only)
 - Messages stored as JSONL — not encrypted at rest
 - **Not intended for internet exposure** — designed for air-gapped home networks
 
