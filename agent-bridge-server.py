@@ -31,6 +31,7 @@ from pathlib import Path
 
 try:
     from fastapi import FastAPI, HTTPException, Request, Query
+    from fastapi.responses import JSONResponse
     import uvicorn
     HAS_FASTAPI = True
 except ImportError:
@@ -44,8 +45,13 @@ STATS_FILE = QUEUE_DIR / "stats.jsonl"
 CONFIG_FILE = QUEUE_DIR / "port.txt"
 LOCK_FILE = QUEUE_DIR / "queue.lock"
 MAX_BODY_SIZE = 64 * 1024  # 64KB max request body
+MAX_TEXT_SIZE = 10 * 1024  # 10KB max text field
 
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600  # 7 days
+
+# Auth token — shared secret that all agents must present
+AUTH_TOKEN_FILE = QUEUE_DIR / "auth_token"
+_MAX_TEXT_SIZE = MAX_TEXT_SIZE  # module-level constant for use in closures
 
 # Valid message types
 VALID_MESSAGE_TYPES = frozenset(["health_check", "proposal", "task", "response", "note", "alert", ""])
@@ -72,6 +78,31 @@ def save_callbacks():
         CALLBACKS_FILE.chmod(0o600)
     except Exception:
         pass
+
+def get_auth_token() -> str:
+    """Read the shared auth token, generating one if missing."""
+    if AUTH_TOKEN_FILE.exists():
+        try:
+            return AUTH_TOKEN_FILE.read_text().strip()
+        except OSError:
+            pass
+    # Generate a new random token
+    import secrets
+    token = secrets.token_hex(32)
+    try:
+        AUTH_TOKEN_FILE.write_text(token)
+        AUTH_TOKEN_FILE.chmod(0o600)
+    except OSError:
+        pass
+    return token
+
+def check_auth(token: str) -> bool:
+    """Verify the presented token matches the stored one."""
+    if not token:
+        return False
+    expected = get_auth_token()
+    import secrets
+    return secrets.compare_digest(token, expected)
 
 # Load callbacks on startup
 load_callbacks()
@@ -207,15 +238,23 @@ def oldest_message_age_seconds(messages) -> int:
     """Compute age of oldest message in queue."""
     if not messages:
         return 0
-    try:
-        oldest = min(m["time"] for m in messages)
-        ts = datetime.fromisoformat(oldest)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        delta = datetime.now(timezone.utc) - ts
-        return int(delta.total_seconds())
-    except (ValueError, TypeError, KeyError):
+    oldest_ts = None
+    for m in messages:
+        try:
+            raw = m.get("time", "")
+            if not raw:
+                continue
+            ts = datetime.fromisoformat(raw)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if oldest_ts is None or ts < oldest_ts:
+                oldest_ts = ts
+        except (ValueError, TypeError):
+            continue  # skip malformed timestamps instead of returning 0
+    if oldest_ts is None:
         return 0
+    delta = datetime.now(timezone.utc) - oldest_ts
+    return int(delta.total_seconds())
 
 
 def last_activity_time(messages) -> str:
@@ -284,10 +323,14 @@ def add_message(text: str, from_agent: str, to_agent: str = "", expires_at: str 
     return msg
 
 
-def get_messages(for_agent: str = "", msg_type: str = "") -> list:
+def get_messages(for_agent: str = "", msg_type: str = "", include_broadcast: bool = False) -> list:
     """
     Get pending messages with file locking.
     Filter by recipient (for_agent) and/or message type.
+
+    By default, broadcast messages (to="") are NOT returned for agent-specific
+    queries — only messages explicitly addressed to the agent are returned.
+    Pass include_broadcast=True to also include broadcast messages.
     """
     lock_fd = acquire_lock()
     try:
@@ -296,7 +339,10 @@ def get_messages(for_agent: str = "", msg_type: str = "") -> list:
         messages, _ = prune_expired(messages, now_fn)
 
         if for_agent:
-            messages = [m for m in messages if m.get("to", "") == for_agent or m.get("to", "") == ""]
+            if include_broadcast:
+                messages = [m for m in messages if m.get("to", "") == for_agent or m.get("to", "") == ""]
+            else:
+                messages = [m for m in messages if m.get("to", "") == for_agent]
         if msg_type:
             messages = [m for m in messages if m.get("type", "") == msg_type]
 
@@ -337,7 +383,7 @@ def batch_ack_messages(msg_ids: list, acknowledged_by: str) -> dict:
     """
     Acknowledge multiple messages in one call.
     Returns dict with acknowledged, not_found lists.
-    All-or-nothing: only removes messages if ALL IDs exist.
+    Partial processing: removes whatever IDs exist, reports the rest as not_found.
     """
     if not msg_ids:
         return {"acknowledged": [], "not_found": [], "acknowledged_at": now_iso()}
@@ -355,21 +401,20 @@ def batch_ack_messages(msg_ids: list, acknowledged_by: str) -> dict:
         for mid in msg_ids:
             if mid not in existing_ids:
                 not_found.append(mid)
+            else:
+                acknowledged.append(mid)
 
-        if not not_found:
-            # All IDs exist — remove them all atomically
-            remaining = [m for m in messages if m["id"] not in msg_ids]
+        if acknowledged:
+            # Remove only the acknowledged (existing) IDs — partial processing
+            remaining = [m for m in messages if m["id"] not in acknowledged]
             save_queue(remaining, lock_fd)
-            acknowledged = list(msg_ids)
-
             ack_time = now_iso()
-            for mid in acknowledged:
-                ack_info = {"id": mid, "processed_at": ack_time, "acknowledged_by": acknowledged_by}
-                with open(PROCESSED_FILE, 'a') as f:
+            with open(PROCESSED_FILE, 'a') as f:
+                for mid in acknowledged:
+                    ack_info = {"id": mid, "processed_at": ack_time, "acknowledged_by": acknowledged_by}
                     f.write(json.dumps(ack_info) + '\n')
             _stats.total_processed += len(acknowledged)
             _stats.save()
-        # else: some IDs not found — do nothing (all-or-nothing), return not_found list
 
     finally:
         release_lock(lock_fd)
@@ -440,7 +485,27 @@ def trigger_callback(agent: str, message: dict):
 
 
 if HAS_FASTAPI:
+    from fastapi import Header
+    from fastapi.responses import JSONResponse as _JSONResponse
     app = FastAPI(title="Home Agent Bridge v2", description="HTTP bridge for inter-agent communication")
+
+    async def verify_auth(x_agent_token: str = Header("", description="Shared auth token")):
+        """Dependency: require valid auth token on every request."""
+        if not check_auth(x_agent_token):
+            raise HTTPException(status_code=401, detail="Invalid or missing auth token")
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        """Reject unauthenticated requests (skip /status for health checks)."""
+        if request.url.path == "/status":
+            return await call_next(request)
+        token = request.headers.get("x-agent-token", "")
+        if not check_auth(token):
+                return _JSONResponse(
+                status_code=401,
+                content={"error": "Invalid or missing auth token"}
+            )
+        return await call_next(request)
 
     @app.post("/callback")
     async def register_callback(body: dict):
@@ -465,13 +530,24 @@ if HAS_FASTAPI:
             if scheme not in ("http", "https"):
                 raise HTTPException(status_code=400, detail="Only http/https schemes allowed")
 
-            # Only allow localhost connections (security boundary)
-            if hostname not in ("localhost", "127.0.0.1", "::1"):
-                raise HTTPException(status_code=400, detail="Callback URL must be localhost")
-
-            # Block obviously malicious hostnames
-            if hostname.startswith("169.254.169.254") or hostname == "metadata.google.internal":
-                raise HTTPException(status_code=400, detail="Cloud metadata endpoints not allowed")
+            # Resolve hostname to IP and verify it's localhost
+            import socket
+            try:
+                addr_info = socket.getaddrinfo(hostname, None)
+                ip = addr_info[0][4][0]
+                # Check: loopback (127.0.0.0/8), ::1, or mapped IPv6
+                is_localhost = (
+                    ip.startswith("127.") or
+                    ip == "::1" or
+                    ip == "0.0.0.0"
+                )
+                # Also block cloud metadata
+                if ip.startswith("169.254.") or ip == "metadata.google.internal":
+                    raise HTTPException(status_code=400, detail="Cloud metadata endpoints not allowed")
+                if not is_localhost:
+                    raise HTTPException(status_code=400, detail="Callback URL must be localhost")
+            except socket.gaierror:
+                raise HTTPException(status_code=400, detail="Cannot resolve callback hostname")
 
         except HTTPException:
             raise
@@ -499,6 +575,9 @@ if HAS_FASTAPI:
             raise HTTPException(status_code=413, detail="Request body too large")
 
         text = body.get("text", "")
+        if len(text) > MAX_TEXT_SIZE:
+            raise HTTPException(status_code=400, detail=f"'text' exceeds max size of {MAX_TEXT_SIZE} bytes")
+
         from_agent = body.get("from", "unknown")
         to_agent = body.get("to", "")
         expires_at = body.get("expires_at", "")
@@ -532,14 +611,15 @@ if HAS_FASTAPI:
     @app.get("/messages")
     async def list_messages(
         for_agent: str = Query("", description="Filter messages for this recipient"),
-        msg_type: str = Query("", description="Filter by message type")
+        msg_type: str = Query("", description="Filter by message type"),
+        include_broadcast: bool = Query(False, description="Include broadcast (to=\"\") messages"),
     ):
         if msg_type and msg_type not in VALID_MESSAGE_TYPES:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid 'type': {msg_type!r}. Must be one of: {', '.join(sorted(VALID_MESSAGE_TYPES))}"
             )
-        raw = get_messages(for_agent, msg_type)
+        raw = get_messages(for_agent, msg_type, include_broadcast=include_broadcast)
         messages = [
             {
                 "id": m["id"],
@@ -607,7 +687,23 @@ if HAS_FASTAPI:
 else:
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
+    def check_auth_header(headers) -> bool:
+        """Check X-Agent-Token header in fallback HTTP server."""
+        # BaseHTTPRequestHandler.headers is a cgi.FieldStorage / Message object
+        token = headers.get("x-agent-token", headers.get("X-Agent-Token", ""))
+        return check_auth(token)
+
     class BridgeHandler(BaseHTTPRequestHandler):
+        def _auth_check(self):
+            """Return True if authorized, False to halt with 401."""
+            if not check_auth_header(self.headers):
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Invalid or missing auth token"}).encode())
+                return False
+            return True
+
         def _json_response(self, data: dict, status: int = 200):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -620,7 +716,10 @@ else:
         def do_GET(self):
             if self.path == "/status":
                 self._json_response(get_status())
-            elif self.path == "/callbacks":
+                return
+            if not self._auth_check():
+                return
+            if self.path == "/callbacks":
                 self._json_response({"callbacks": dict(CALLBACKS)})
             elif self.path.startswith("/messages"):
                 # Parse query params with URL decoding
@@ -656,6 +755,8 @@ else:
                 self._error_response(404, "Not found")
 
         def do_POST(self):
+            if not self._auth_check():
+                return
             if self.path == "/message":
                 content_len = int(self.headers.get("Content-Length", 0))
                 if content_len > MAX_BODY_SIZE:
@@ -675,6 +776,9 @@ else:
                 text = data.get("text", "").strip()
                 if not text:
                     self._error_response(400, "Missing or empty 'text' field")
+                    return
+                if len(text) > MAX_TEXT_SIZE:
+                    self._error_response(400, f"'text' exceeds max size of {MAX_TEXT_SIZE} bytes")
                     return
 
                 from_agent = data.get("from", "unknown")
@@ -802,6 +906,8 @@ else:
                 self._error_response(404, "Not found")
 
         def do_DELETE(self):
+            if not self._auth_check():
+                return
             if not self.path.startswith("/message/"):
                 self._error_response(404, "Not found")
                 return
