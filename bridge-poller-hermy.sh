@@ -15,6 +15,13 @@ set -euo pipefail
 # =============================================================================
 # CONFIG
 # =============================================================================
+# Load env from Hermes profile if available (allows cron to run with full env)
+if [[ -f "$HOME/.hermes/.env" ]]; then
+    set -a
+    source "$HOME/.hermes/.env"
+    set +a
+fi
+
 BRIDGE_URL="${BRIDGE_URL:-http://localhost:18473}"
 AUTH_TOKEN_FILE="${AUTH_TOKEN_FILE:-/tmp/agent-bridge/auth_token}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN env required}"
