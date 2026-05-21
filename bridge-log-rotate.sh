@@ -54,7 +54,7 @@ if [ -f "$PROCESSED_FILE" ] && [ -s "$PROCESSED_FILE" ]; then
         # Atomic: write archive to temp dir, then rename into place
         archive_basename="processed-$(date +%Y%m%d).jsonl.gz"
         archive_tmp="$WORK_DIR/$archive_basename"
-        gzip > "$archive_tmp"
+        gzip -c "$temp_archive" > "$archive_tmp"
         mv "$archive_tmp" "$ARCHIVE_DIR/$archive_basename"
         # Atomic: replace processed.jsonl
         mv "$remaining" "$PROCESSED_FILE"
