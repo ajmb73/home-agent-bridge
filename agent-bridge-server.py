@@ -610,7 +610,7 @@ if HAS_FASTAPI:
 
     @app.get("/messages")
     async def list_messages(
-        for_agent: str = Query("", description="Filter messages for this recipient"),
+        for_agent: str = Query("", alias="for", description="Filter messages for this recipient"),
         msg_type: str = Query("", description="Filter by message type"),
         include_broadcast: bool = Query(False, description="Include broadcast (to=\"\") messages"),
     ):

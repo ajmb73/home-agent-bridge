@@ -96,7 +96,7 @@ main() {
     if [[ -n "$auth_token" ]]; then
         curl_cmd+=("-H" "x-agent-token: $auth_token")
     fi
-    curl_cmd+=("${BRIDGE_URL}/messages?to=hermy")
+    curl_cmd+=("${BRIDGE_URL}/messages?for=hermy")
 
     # Poll bridge
     local response
@@ -150,6 +150,16 @@ for m in msgs:
         text=$(echo "$msg_line" | python3 -c "import sys,json; print(json.load(sys.stdin)['text'])")
 
         log "INFO" "From=$from id=$id text=${text:0:80}"
+
+        if [[ "$from" == "bobby" ]]; then
+            local inbox_file="/home/ale/.hermes/bridge-inbox.md"
+            local timestamp
+            timestamp=$(date '+%Y-%m-%d %H:%M')
+            if [[ ! -f "$inbox_file" ]] || ! grep -q "## 📨 Bridge Messages from Bobby" "$inbox_file" 2>/dev/null; then
+                printf '\n## 📨 Bridge Messages from Bobby\n\n' >> "$inbox_file"
+            fi
+            printf -- '- **%s** — [bobby] %s\n' "$timestamp" "$text" >> "$inbox_file"
+        fi || true
 
         # TODO: Add message handling logic here.
         # For now, just log and ack. If a message requires a response,
