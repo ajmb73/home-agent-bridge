@@ -20,6 +20,9 @@ BRIDGE_URL="${BRIDGE_URL:-http://localhost:18473}"
 AUTH_TOKEN_FILE="${AUTH_TOKEN_FILE:-/tmp/agent-bridge/auth_token}"
 LOG_FILE="${LOG_FILE:-/home/ale/.hermes/logs/bridge-poller.log}"
 LOCK_FILE="/tmp/bridge-poller-hermy.lock"
+
+# Encryption key path for E2E queue encryption
+export BRIDGE_ENCRYPTION_KEY_FILE="/home/ale/.hermes/bridge.key"
 DRY_RUN=""
 ONCE_MODE=""
 
@@ -152,24 +155,24 @@ for m in msgs:
         log "INFO" "From=$from id=$id text=${text:0:80}"
 
         if [[ "$from" == "bobby" ]]; then
-            local inbox_file="/home/ale/.hermes/bridge-inbox.md"
             local timestamp
             timestamp=$(date '+%Y-%m-%d %H:%M')
+
+            # Write to bridge-inbox.md (cumulative record)
+            local inbox_file="/home/ale/.hermes/bridge-inbox.md"
             if [[ ! -f "$inbox_file" ]] || ! grep -q "## 📨 Bridge Messages from Bobby" "$inbox_file" 2>/dev/null; then
                 printf '\n## 📨 Bridge Messages from Bobby\n\n' >> "$inbox_file"
             fi
             printf -- '- **%s** — [bobby] %s\n' "$timestamp" "$text" >> "$inbox_file"
-        fi || true
 
-        # TODO: Add message handling logic here.
-        # For now, just log and ack. If a message requires a response,
-        # POST to /message with from=hermy and to=<sender>, then ack.
-        #
-        # Example — reply to sender:
-        #   curl -s -X POST "${BRIDGE_URL}/message" \
-        #     -H "Content-Type: application/json" \
-        #     -H "x-agent-token: $auth_token" \
-        #     -d "{\"from\":\"hermy\",\"to\":\"$from\",\"text\":\"ack\",\"type\":\"note\"}"
+            # Write to daily memory (same pattern as Bobby's poller)
+            local mem_file="/home/ale/.hermes/memory/$(date +%Y-%m-%d).md"
+            mkdir -p "$(dirname "$mem_file")"
+            if ! grep -q "## 📨 Bridge Messages from Bobby" "$mem_file" 2>/dev/null; then
+                printf '\n## 📨 Bridge Messages from Bobby\n\n' >> "$mem_file"
+            fi
+            printf -- '- **%s** — %s\n' "$timestamp" "$text" >> "$mem_file"
+        fi || true
 
         if [[ -z "$DRY_RUN" ]]; then
             local ack_resp
