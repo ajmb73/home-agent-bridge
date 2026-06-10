@@ -178,7 +178,14 @@ for m in msgs:
             local timestamp
             timestamp=$(date '+%Y-%m-%d %H:%M')
 
-            # Write to bridge-inbox.md (cumulative record)
+            # Write to machine-readable inbox (JSONL — for agent processing)
+            local inbox_jsonl="/home/ale/.hermes/bridge-inbox.jsonl"
+            local iso_ts
+            iso_ts=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+            printf '{"id":"%s","received_at":"%s","from":"%s","text":"%s"}\n' \
+                "$id" "$iso_ts" "$from" "$(echo "$text" | sed 's/"/\\"/g')" >> "$inbox_jsonl"
+
+            # Write to bridge-inbox.md (cumulative record, human-readable)
             local inbox_file="/home/ale/.hermes/bridge-inbox.md"
             if [[ ! -f "$inbox_file" ]] || ! grep -q "## 📨 Bridge Messages from Bobby" "$inbox_file" 2>/dev/null; then
                 printf '\n## 📨 Bridge Messages from Bobby\n\n' >> "$inbox_file"
@@ -192,6 +199,9 @@ for m in msgs:
                 printf '\n## 📨 Bridge Messages from Bobby\n\n' >> "$mem_file"
             fi
             printf -- '- **%s** — %s\n' "$timestamp" "$text" >> "$mem_file"
+
+            # Set pending flag (timestamp in seconds)
+            date +%s > "/home/ale/.hermes/.bridge-pending"
         fi || true
 
         if [[ -z "$DRY_RUN" ]]; then
