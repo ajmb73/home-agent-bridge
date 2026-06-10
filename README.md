@@ -1,37 +1,69 @@
 # Home Agent Bridge
 
-A lightweight HTTP bridge that enables two different AI agent frameworks — [OpenClaw](https://github.com/nousresearch/openclaw) and [Hermes Agent](https://hermes-agent.nousresearch.com/) — to communicate with each other on the same home server, in real-time, without cloud dependencies.
+A lightweight HTTP bridge that enables two different AI agent frameworks — [OpenClaw](https://github.com/nousresearch/openclaw) (Bobby) and [Hermes Agent](https://hermes-agent.nousresearch.com/) — to communicate with each other on the same home server, in real-time, without cloud dependencies.
 
 ## The Problem
 
 Home server enthusiasts often run multiple AI agents for different tasks (home automation, coding, research, etc.). These agents are built on different frameworks and don't natively talk to each other. Existing solutions require cloud services, complex infrastructure, or custom integrations that break on every update.
 
-## The Solution
+## The Solution: Two-Stage Inbox Pipeline
 
-Home Agent Bridge creates a simple HTTP-based message queue that runs entirely on your local network:
+Home Agent Bridge provides a simple HTTP message queue with a **two-stage pipeline** that ensures no messages are lost:
 
 ```
-OpenClaw Agent  ←→  HTTP Bridge (port 18473)  ←→  Hermes Agent
+                ┌────────────────────────────────────────────┐
+                │              Bridge Server                 │
+                │         (127.0.0.1:18473)                  │
+                │  ┌─────────────────────────────────────┐   │
+                │  │  Stage 1: Queue (JSONL files)       │   │
+                │  │  Messages survive restarts           │   │
+                │  └─────────────────────────────────────┘   │
+                └────────────────────────────────────────────┘
+                           ▲            │
+                  POST /message    GET /messages
+                           │            ▼
+                ┌────────────────────────────────────────────┐
+                │         Dumb Bash Pollers (every 1 min)    │
+                │  Stage 2: Write to persistent JSONL inbox  │
+                │  + set .bridge-pending flag, ACK bridge    │
+                └────────────────────────────────────────────┘
+                           │            │
+                           ▼            ▼
+                ┌────────────────────────────────────────────┐
+                │      LLM Agent Processors (every 10 min)   │
+                │  Read inbox → trigger agent → respond via  │
+                │  bridge HTTP POST → mark processed         │
+                └────────────────────────────────────────────┘
 ```
 
-- OpenClaw Agent POSTs messages to the bridge
-- Hermes Agent polls or receives notifications
-- Responses written back via shared file
-- Entirely local, no internet required
+### Architecture Decision: Two Dumb Pollers vs One Smart Agent
+
+The previous architecture (v1 File Bridge, v2 SQLite Bus) used LLM-powered pollers that created feedback loops — one agent responded to its own messages. The current design uses a **deliberate separation**:
+
+- **Dumb pollers** (bash scripts, no LLM) — just move messages from bridge to persistent inbox
+- **LLM processors** (triggered by cron) — read the inbox, understand, respond, and mark processed
+- Messages are never destroyed until the LLM agent explicitly marks them as `processed_by`
+
+### Key Insight: What Broke Before (Fixed Jun 10 2026)
+
+The original dumb pollers had a critical bug: they **acked messages from the bridge queue** immediately after logging them to a daily memory file, without ever handing them to the LLM agent. The message went: bridge → logged → acked → gone, silently. When the agent checked the bridge, it saw nothing.
+
+The fix: pollers now write to a **machine-readable JSONL inbox file** before acking. A separate cron-driven processor reads the inbox and triggers the agent.
 
 ## Features
 
 - **Framework-agnostic**: Works with any AI agent that can make HTTP POST requests
-- **Responsive**: Sub-second latency when Hermes polls the bridge frequently (configurable poll interval)
+- **Responsive**: Sub-second latency when pollers run every minute
+- **No message loss**: Two-stage architecture ensures agent sees every message
 - **Secure**: Binds to localhost only — not exposed to the internet
 - **Stateless**: Messages queued in JSONL files — survives restarts
 - **Batch operations**: Acknowledge multiple messages in a single request (v2.0.0)
+- **E2E encryption**: Optional Fernet encryption of message text at rest (v2.1.0)
 
 ## Requirements
 
 - Python 3.8+
 - Both agents running on the same machine (or same local network)
-- SSH access between agents (for Hermes CLI invocations)
 - Auth token file at `/tmp/agent-bridge/auth_token` (auto-generated on first server start)
 
 ## Quick Start
@@ -212,36 +244,77 @@ Messages are stored as JSONL files in `/tmp/agent-bridge/`:
 
 Processed entries are archived daily via `bridge-log-rotate.sh` (runs as a cron job) and stored in gzip archives with configurable retention (default: 7-day live, 30-day archive).
 
-## Polling Scripts
+## Two-Stage Pipeline: Pollers + Processors
 
-Hermes Agent uses a polling script (`bridge-poller-hermy.sh`) to receive messages in real-time. This script runs every minute via cron, polls the bridge for messages addressed to the Hermes Agent identity, and forwards them to Telegram.
+### Stage 1: Dumb Pollers (every 1 min)
 
-### bridge-poller-hermy.sh (Hermes Agent side)
+Both agents have bash pollers that run every minute via system cron. They are intentionally **dumb** (no LLM) to avoid feedback loops:
 
+**Hermes side** — `bridge-poller-hermy.sh`:
+- Polls `GET /messages?for=hermy` from the bridge
+- Writes each message to:
+  - Machine-readable JSONL: `~/.hermes/bridge-inbox.jsonl`
+  - Human-readable log: `~/.hermes/bridge-inbox.md`
+  - Daily memory: `~/.hermes/memory/YYYY-MM-DD.md`
+- Sets `.bridge-pending` flag (timestamp)
+- Acks the message from the bridge queue
+- Logs to `~/.hermes/logs/bridge-poller.log`
+
+**OpenClaw side** — `bobby-http-poller.sh`:
+- Polls `GET /messages?for=bobby` from the bridge
+- Writes each message to:
+  - Machine-readable JSONL: `~/clawd/bridge-inbox.jsonl`
+  - Daily memory: `~/clawd/memory/YYYY-MM-DD.md`
+- Sends a receipt back via bridge POST
+- Sets `.bridge-inbox-pending` flag
+- Acks the message from the bridge queue
+- Logs to `~/clawd/logs/bobby-http-poller.log`
+
+### Stage 2: Agent Processors
+
+**OpenClaw side** — `bridge-inbox-processor.sh` (every 10 min via cron):
+- Reads `~/clawd/bridge-inbox.jsonl` for unprocessed messages
+- Triggers Bobby's agent via `hermes chat -q` with instructions to:
+  1. Read and understand each message
+  2. Send a meaningful response back via bridge HTTP POST
+  3. Mark inbox line as `processed_by: "bobby"`
+- Clears the pending flag on completion
+- Logs to `~/clawd/logs/bridge-inbox-processor.log`
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `~/clawd/bridge-inbox.jsonl` | Bobby's machine-readable inbox |
+| `~/.hermes/bridge-inbox.jsonl` | Hermy's machine-readable inbox |
+| `~/.hermes/bridge-inbox.md` | Hermy's human-readable inbox log |
+| `~/clawd/.bridge-inbox-pending` | Pending flag (Bobby side) |
+| `~/.hermes/.bridge-pending` | Pending flag (Hermy side) |
+
+### Cron Jobs
+
+```bash
+# Bobby's poller (every 1 min)
+*/1 * * * * /home/ale/scripts/bobby-http-poller.sh
+
+# Hermy's poller (every 1 min)
+*/1 * * * * /home/ale/.hermes/scripts/bridge-poller-hermy.sh
+
+# Bobby's inbox processor (every 10 min)
+*/10 * * * * /home/ale/scripts/bridge-inbox-processor.sh >> /home/ale/clawd/logs/bridge-inbox-processor.log
 ```
-*/1 * * * * export TELEGRAM_BOT_TOKEN="$(grep TELEGRAM_BOT_TOKEN /home/ale/.hermes/.env | cut -d= -f2)" && export TELEGRAM_CHAT_ID="$(grep TELEGRAM_HOME_CHANNEL /home/ale/.hermes/.env | cut -d= -f2)" && /home/ale/.hermes/scripts/bridge-poller-hermy.sh > /dev/null 2>&1
-```
-
-Features:
-- Polls `GET /messages` filtered by Hermes Agent recipient every minute
-- Forwards messages to Telegram (chat ID from `~/.hermes/.env`)
-- Rate-limited to 1 message per 30 seconds (prevents flooding)
-- Idempotent via `flock` (prevents duplicate sends)
-- Leaves messages in queue if Telegram fails (retry on next poll)
-- Logs to `/home/ale/.hermes/logs/bridge-poller.log`
-
-### bridge-poll.sh (OpenClaw side)
-
-OpenClaw Agent uses a simpler poller at `/tmp/bridge-poll.sh`:
-```
-*/1 * * * * /tmp/bridge-poll.sh > /dev/null 2>&1
-```
-
-Both pollers ensure bidirectional real-time communication between the two agents.
 
 ## Version
 
-Current version: `2.0.1` — see `VERSION` file in repo.
+Current version: `2.1.0` — see `VERSION` file in repo.
+
+## Changelog
+
+### 2.1.0 (Jun 10 2026)
+- **Two-stage inbox pipeline**: Pollers now write to persistent JSONL inbox instead of just acking
+- **Bridge inbox processor**: New `bridge-inbox-processor.sh` cron to trigger agent message processing
+- **No message loss**: Fixed bug where pollers acked messages before LLM agents could read them
+- **E2E encryption**: Fernet encryption for message text at rest (v2.1.0 bridge server)
 
 ## Security Notes
 
