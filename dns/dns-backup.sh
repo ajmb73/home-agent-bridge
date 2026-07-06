@@ -1,0 +1,1 @@
+/home/ale/scripts/dns/dns-backup.sh
