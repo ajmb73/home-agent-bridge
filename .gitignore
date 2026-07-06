@@ -4,3 +4,5 @@
 
 # OS
 .DS_Store__pycache__/
+
+__pycache__/
