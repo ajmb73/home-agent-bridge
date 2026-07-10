@@ -1,89 +1,84 @@
 #!/bin/bash
-# Daily Self-Diagnostic Data Collector — v2
-# Feeds system state into the agent's context for AI-driven analysis.
-# The agent reasons about this data, it doesn't just pass/fail.
+# Daily Self-Diagnostic Watchdog — v3
+# Silent when healthy, alerts only on real problems.
+# Designed for no_agent mode: empty output = silent, non-empty = delivered.
 set -uo pipefail
 
-echo "=== TIMESTAMP ==="
-date -u '+%Y-%m-%dT%H:%M:%SZ'
-echo "=== UPTIME ==="
-uptime -p
-echo "=== LOAD ==="
-cat /proc/loadavg
-echo "=== MEMORY ==="
-free -h
-echo "=== DISK ==="
-df -h / /tmp /var 2>/dev/null | tail -n +1
+ISSUES=0
+REPORT=""
 
-echo "=== TOP PROCESSES (by mem) ==="
-ps aux --sort=-%mem | head -15
+check() {
+  local label="$1"
+  local result="$2"
+  if [ "$result" != "0" ]; then
+    ISSUES=$((ISSUES + 1))
+    REPORT+="$label"$'\n'
+  fi
+}
 
-echo "=== FAILED SYSTEMD SERVICES ==="
-systemctl --user list-units --state=failed --no-pager 2>/dev/null || echo "(none or unavailable)"
-sudo systemctl list-units --state=failed --no-pager 2>/dev/null || echo "(no sudo available)"
+# ── Core system ──
+LOAD=$(awk '{print $1}' /proc/loadavg)
+check "High load: $LOAD" "$(echo "$LOAD > 4" | bc -l 2>/dev/null || echo 1)"
 
-echo "=== DOCKER CONTAINERS ==="
-docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null || echo "Docker not available"
+MEM_USED=$(free -m | awk '/^Mem:/{printf "%.0f", $3/$2 * 100}')
+check "Memory >80%: ${MEM_USED}%" "$([ "$MEM_USED" -gt 80 ] && echo 1 || echo 0)"
 
-echo "=== NAS ==="
-ping -c 1 -W 3 192.168.0.16 2>&1 | tail -1
-mount | grep -E "cifs|smb|nfs" 2>/dev/null || echo "No network mounts found"
+DISK_USED=$(df / | awk 'NR==2{print+$5}')
+check "Disk / >80%: ${DISK_USED}%" "$([ "$DISK_USED" -gt 80 ] && echo 1 || echo 0)"
 
-echo "=== HERMES GATEWAY ==="
-systemctl --user is-active hermes-gateway 2>/dev/null || echo "inactive"
-systemctl --user status hermes-gateway --no-pager -l 2>/dev/null | head -8
-# Gateway memory
-GW_PID=$(systemctl --user show hermes-gateway 2>/dev/null | grep ^MainPID= | cut -d= -f2 || echo "0")
-if [ "$GW_PID" != "0" ] && [ -n "$GW_PID" ]; then
-  GW_MEM=$(ps -o rss= -p "$GW_PID" 2>/dev/null | awk '{printf "%.1f MB", $1/1024}' || echo "N/A")
-  echo "Gateway RSS: $GW_MEM"
-fi
+# ── Systemd ──
+FAILED=$(systemctl --user list-units --state=failed --no-pager 2>/dev/null | grep -c "failed" || true)
+check "$FAILED user services failed" "$([ "$FAILED" -gt 0 ] && echo 1 || echo 0)"
 
-echo "=== HERMES VERSION ==="
-hermes --version 2>&1 || echo "hermes not in PATH"
+FAILED_SYS=$(sudo systemctl list-units --state=failed --no-pager 2>/dev/null | grep -c "failed" || true)
+check "$FAILED_SYS system services failed" "$([ "$FAILED_SYS" -gt 0 ] && echo 1 || echo 0)"
 
-echo "=== HERMES DOCTOR (summary) ==="
-hermes doctor 2>&1 | head -40
+# ── Gateway ──
+GW_ACTIVE=$(systemctl --user is-active hermes-gateway 2>/dev/null || echo "inactive")
+check "Gateway: $GW_ACTIVE" "$([ "$GW_ACTIVE" = "active" ] && echo 0 || echo 1)"
 
-echo "=== HINDSIGHT ==="
-for port in 8888 9177; do
-  CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$port/health" --connect-timeout 3 2>/dev/null || echo "000")
-  echo "Port $port: HTTP $CODE"
-done
+# ── Hindsight ──
+HS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8888/health --connect-timeout 3 2>/dev/null || echo "000")
+check "Hindsight health: HTTP $HS_CODE" "$([ "$HS_CODE" = "200" ] && echo 0 || echo 1)"
 
-echo "=== CRON JOBS ==="
-hermes cron list 2>&1 | head -30
-
-echo "=== NETWORK INFRASTRUCTURE ==="
-for target in "NAS:192.168.0.16" "tech1:192.168.0.67" "tech2:192.168.0.68" "pve1:192.168.0.53" "pve2:192.168.0.50" "pve3:192.168.0.51" "Hermy:192.168.0.13" "HA:192.168.0.71" "monitor:192.168.0.17" "internet:1.1.1.1"; do
+# ── Network infrastructure ──
+for target in "NAS:192.168.0.16" "tech1:192.168.0.67" "tech2:192.168.0.68" "pve1:192.168.0.53" "pve2:192.168.0.50" "pve3:192.168.0.51" "Hermy:192.168.0.13" "HA:192.168.0.71" "internet:1.1.1.1"; do
   name="${target%%:*}"
   ip="${target##*:}"
-  ping -c 1 -W 2 "$ip" &>/dev/null && echo "  $name ($ip): OK" || echo "  $name ($ip): UNREACHABLE"
+  if ! ping -c 1 -W 2 "$ip" &>/dev/null; then
+    ISSUES=$((ISSUES + 1))
+    REPORT+="Host down: $name ($ip)"$'\n'
+  fi
 done
 
-echo "=== DNS RESOLUTION ==="
-for dns in "192.168.0.67" "192.168.0.68"; do
-  result=$(dig +short +timeout=2 @$dns google.com 2>/dev/null | head -1)
-  [ -n "$result" ] && echo "  $dns: OK ($result)" || echo "  $dns: FAIL"
+# ── DNS ──
+for dns in "tech1:192.168.0.67" "tech2:192.168.0.68"; do
+  name="${dns%%:*}"
+  ip="${dns##*:}"
+  result=$(dig +short +timeout=2 @"$ip" google.com 2>/dev/null | head -1)
+  if [ -z "$result" ]; then
+    ISSUES=$((ISSUES + 1))
+    REPORT+="DNS resolution failed: $name ($ip)"$'\n'
+  fi
 done
 
-echo "=== HA WEB UI ==="
-curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://192.168.0.71:8123/ 2>/dev/null || echo "HA unreachable"
+# ── Internet ──
+WEB_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.google.com/ 2>/dev/null || echo "000")
+check "Internet: HTTP $WEB_CODE" "$([ "$WEB_CODE" = "200" ] && echo 0 || echo 1)"
 
-echo "=== HERMY A2A ==="
-curl -s -o /dev/null -w "%{http_code}" http://192.168.0.13:8644/health --connect-timeout 5 2>/dev/null || echo "Hermy a2a unreachable"
+# ── HA Web UI ──
+HA_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://192.168.0.71:8123/ 2>/dev/null || echo "000")
+check "HA Web: HTTP $HA_CODE" "$([ "$HA_CODE" = "200" ] && echo 0 || echo 1)"
 
-echo "=== INTERNET ==="
-curl -s -o /dev/null -w "%{http_code}" --max-time 5 https://www.google.com/ 2>/dev/null || echo "Internet HTTPS unreachable"
+# ── A2A Inbox Protocol ──
+if [ ! -d /mnt/nas_share/agent-inbox/inbox/jax/ ]; then
+  check "A2A inbox not mounted or inaccessible" 1
+fi
 
-echo "=== TAILSCALE ==="
-tailscale status 2>/dev/null || echo "tailscale not available"
-
-echo "=== GATEWAY LOG ERRORS (last 24h) ==="
-tail -1000 ~/.hermes/logs/gateway.log 2>/dev/null | grep -i -E "error|fail|crash|oom|killed|timeout|unreachable" | tail -10 || echo "None found"
-
-echo "=== SESSION DB ==="
-ls -lh ~/.hermes/state.db 2>/dev/null
-hermes sessions stats 2>/dev/null | head -5 || true
-
-echo "=== END ==="
+# ── Output ──
+if [ "$ISSUES" -gt 0 ]; then
+  echo "⚠️  $ISSUES issue(s) found:"
+  echo "$REPORT"
+  exit 1
+fi
+# Silent exit 0 — nothing delivered
